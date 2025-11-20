@@ -129,6 +129,96 @@ class DataIngestor:
 
         self.db.execute(query, params)
 
+    def enrich_player_profiles(self, csv_path):
+        """
+        Reads a profile CSV file and updates existing players in the DB
+        with stats, physical attributes, and URLs.
+        """
+        try:
+            logger.info(f"Reading player profiles from: {csv_path}")
+
+            # 1. READ DATA
+            # Using header=0 because the first line contains column names
+            df = pd.read_csv(csv_path)
+
+            # Strip whitespace from column names to be safe
+            df.columns = df.columns.str.strip()
+
+            updated_count = 0
+
+            # 2. ITERATE AND UPDATE
+            for _, row in df.iterrows():
+
+                # -- Data Cleaning --
+                # Remove '#' from jersey number if present (e.g., '#8' -> '8')
+                jersey_num_raw = str(row.get('Jersey Number', '')).replace('#', '')
+
+                # Handle potential NaNs in stats by defaulting to 0.0 if missing
+                def get_float(val):
+                    try:
+                        return float(val)
+                    except (ValueError, TypeError):
+                        return 0.0
+
+                # -- The Update Query --
+                # We look up by 'Jersey Name' matching the 'name' column in the DB.
+                query = """
+                    UPDATE players
+                    SET 
+                        jersey_number = %s,
+                        position = %s,
+                        age = %s,
+                        weight_kg = %s,
+                        height_m = %s,
+                        ppg = %s,
+                        rpg = %s,
+                        apg = %s,
+                        bpg = %s,
+                        spg = %s,
+                        eff = %s,
+                        photo_url = %s,
+                        source_url = %s
+                    WHERE name = %s;
+                """
+
+                params = (
+                    jersey_num_raw,
+                    row['Position'],
+                    int(get_float(row['Age'])),  # Ensure Integer
+                    get_float(row['Weight (kg)']),
+                    get_float(row['Height (m)']),
+                    get_float(row['PPG (Points)']),
+                    get_float(row['RPG (Rebounds)']),
+                    get_float(row['APG (Assists)']),
+                    get_float(row['BPG (Blocks)']),
+                    get_float(row['SPG (Steals)']),
+                    get_float(row['EFF (Efficiency)']),
+                    row['Photo URL'],
+                    row['Source URL'],
+                    row['Jersey Name'].strip()  # This is the WHERE clause matcher
+                )
+
+                # Execute
+                # Note: execute returns number of rows affected (usually)
+                # If your dbconn wrapper returns something else, adjust logic below.
+                result = self.db.execute(query, params)
+
+                # Check if a row was actually found and updated
+                # Depending on your dbconn implementation, result might be rowcount or None.
+                # If dbconn.execute returns a cursor or raw result, you might need rowcount.
+                # Assuming standard behavior here:
+                if result:
+                    updated_count += 1
+                else:
+                    logger.warning(f"Player not found in DB: {row['Jersey Name']}")
+
+            logger.info(f"Profile enrichment complete. Updated {updated_count} players.")
+            return updated_count
+
+        except Exception as e:
+            logger.error(f"Failed during profile enrichment: {e}", exc_info=True)
+            return 0
+
 
 # =======================================================================
 # EXECUTION BLOCK FOR TESTING AND DATA INGESTION
@@ -161,4 +251,6 @@ def ini():
     else:
         logger.warning("Ingestion finished with 0 new active sessions inserted.")
 
-ini()
+
+di = DataIngestor(db_config=DB_CONFIG)
+di.enrich_player_profiles('./data/athlete-data.csv')
