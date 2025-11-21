@@ -3,3 +3,7 @@ venv/
 *.xls
 *.xlsm
 *.ods
+*.pyc
+__pycache__/
+.DS_Store
+Backend/.venv/
