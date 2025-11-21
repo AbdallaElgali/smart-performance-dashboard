@@ -4,6 +4,22 @@ from dbconn import Database
 from datetime import datetime, timedelta
 import statistics
 from datetime import date
+import pickle
+import pandas as pd
+import numpy as np
+
+# ================= MODEL LOADING =================
+# Load models once at startup to save performance
+try:
+    with open('models/model_forecast_xgb.pkl', 'rb') as f:
+        load_model = pickle.load(f)
+    with open('models/model_risk_xgb.pkl', 'rb') as f:
+        risk_model = pickle.load(f)
+    print("✅ ML Models loaded successfully.")
+except Exception as e:
+    print(f"⚠️ Error loading models: {e}")
+    load_model = None
+    risk_model = None
 
 # ================= CONFIGURATION =================
 app = Flask(__name__)
@@ -44,41 +60,6 @@ def get_all_players():
     return jsonify({"error": "No players found"}), 404
 
 
-# -------------------------------------------------
-# 2. DASHBOARD OVERVIEW (The "Main" Screen)
-# -------------------------------------------------
-@app.route('/api/dashboard/team-status', methods=['GET'])
-def get_team_status():
-    """
-    Returns the latest readiness and load status for the whole team.
-    Joins Players, Sessions (Load), and Wellness (Readiness).
-    """
-    # We get the data for the most recent date in the database
-    query = """
-        WITH LatestDate AS (
-            SELECT MAX(activity_date) as max_date FROM sessions
-        )
-        SELECT 
-            p.name,
-            p.player_position,
-            s.load_rpe,
-            s.ac_ratio,
-            s.efficiency_index,
-            w.readiness_score,
-            -- Simple Logic for Traffic Light Status
-            CASE 
-                WHEN s.ac_ratio > 1.5 OR w.readiness_score < 40 THEN 'RED'
-                WHEN s.ac_ratio < 0.8 THEN 'YELLOW'
-                ELSE 'GREEN'
-            END as status_color
-        FROM players p
-        JOIN sessions s ON p.player_id = s.player_id
-        LEFT JOIN daily_wellness w ON p.player_id = w.player_id AND s.activity_date = w.report_date
-        JOIN LatestDate ld ON s.activity_date = ld.max_date
-        ORDER BY status_color DESC, s.load_rpe DESC;
-    """
-    data = db.execute(query, fetch_all=True)
-    return jsonify(data if data else []), 200
 
 # -------------------------------------------------
 # HELPERS
@@ -270,83 +251,69 @@ def get_player_trends(player_id):
 
 
 # -------------------------------------------------
-# 4. INPUT DATA (Wellness Check-In)
-# -------------------------------------------------
-@app.route('/api/wellness', methods=['POST'])
-def submit_wellness():
-    """
-    Frontend sends: {player_id, sleep_quality, soreness, stress}
-    We calculate readiness and insert.
-    """
-    data = request.json
-
-    # Simple heuristic for Readiness Score (0-100)
-    # (Sleep * 4) + (10 - Soreness * 2) + (10 - Stress * 2) ... simplified mapping
-    # Assuming inputs are 1-10 for sleep, 1-5 for others
-    readiness = (data['sleep_quality'] * 10 * 0.5) + ((6 - data['soreness']) * 10 * 0.25) + (
-                (6 - data['stress']) * 10 * 0.25)
-
-    query = """
-        INSERT INTO daily_wellness 
-        (player_id, report_date, sleep_quality, soreness_level, stress_level, readiness_score)
-        VALUES (%s, CURRENT_DATE, %s, %s, %s, %s)
-        RETURNING wellness_id;
-    """
-    params = (
-        data['player_id'],
-        data['sleep_quality'],
-        data['soreness'],
-        data['stress'],
-        int(readiness)
-    )
-
-    result = db.execute(query, params, fetch_one=True)
-
-    if result:
-        return jsonify({"message": "Wellness logged", "id": result['wellness_id']}), 201
-    return jsonify({"error": "Failed to log wellness"}), 500
-
-
-# -------------------------------------------------
-# 5. TEAM ANALYSIS (Macro View)
+# 5. TEAM ANALYSIS (Macro View) - HISTORICAL DATA FIX
 # -------------------------------------------------
 @app.route('/api/analysis/team', methods=['GET'])
 def get_team_analysis():
     """
-    Aggregates data for the last 7 and 28 days to compare players.
-    Returns: Team Average, Risky Players, High Performers.
+    Aggregates data for the last 7 and 28 days RELATIVE TO THE LATEST DATA POINT.
+    This allows analysis of historical datasets where CURRENT_DATE would return nothing.
     """
-    # Fetch aggregated loads for last 7 days (Acute) and 28 days (Chronic)
     query = """
+        WITH LatestData AS (
+            -- 1. Find the most recent date in the database
+            SELECT MAX(activity_date) as anchor_date FROM sessions
+        )
         SELECT 
             p.player_id, 
             p.name, 
             p.player_position as position,
-            COUNT(s.session_id) as session_count,
-            SUM(CASE WHEN s.activity_date >= CURRENT_DATE - INTERVAL '7 days' THEN s.load_rpe ELSE 0 END) as acute_load,
-            SUM(CASE WHEN s.activity_date >= CURRENT_DATE - INTERVAL '28 days' THEN s.load_rpe ELSE 0 END) as chronic_sum
+            -- Count sessions in the last 28 days relative to anchor
+            COUNT(CASE WHEN s.activity_date > (ld.anchor_date - INTERVAL '28 days') THEN 1 END) as session_count,
+
+            -- Acute Load: Sum of load in last 7 days relative to anchor
+            SUM(CASE 
+                WHEN s.activity_date > (ld.anchor_date - INTERVAL '7 days') 
+                THEN s.load_rpe ELSE 0 
+            END) as acute_load,
+
+            -- Chronic Load: Sum of load in last 28 days relative to anchor
+            SUM(CASE 
+                WHEN s.activity_date > (ld.anchor_date - INTERVAL '28 days') 
+                THEN s.load_rpe ELSE 0 
+            END) as chronic_sum,
+
+            -- Pass the anchor date back so frontend knows when this data is from
+            ld.anchor_date
+
         FROM players p
+        CROSS JOIN LatestData ld
         LEFT JOIN sessions s ON p.player_id = s.player_id 
-        AND s.activity_date >= CURRENT_DATE - INTERVAL '28 days'
-        GROUP BY p.player_id, p.name, p.player_position;
+        -- Optimization: Only join relevant recent rows to keep query fast
+        AND s.activity_date > (ld.anchor_date - INTERVAL '28 days')
+
+        GROUP BY p.player_id, p.name, p.player_position, ld.anchor_date;
     """
+
     data = db.execute(query, fetch_all=True)
 
     if not data:
-        return jsonify({"error": "No data found"}), 404
+        return jsonify({"error": "No data found", "roster": [], "team_avg_load": 0}), 200
 
     processed_roster = []
 
     # Calculate Team Averages for Context
-    all_acute_loads = [d['acute_load'] for d in data]
+    all_acute_loads = [float(d['acute_load'] or 0) for d in data]
     team_avg_acute = statistics.mean(all_acute_loads) if all_acute_loads else 0
 
     for p in data:
         acute = float(p['acute_load'] or 0)
-        # Chronic Load is average per day over 28 days, roughly
         chronic_total = float(p['chronic_sum'] or 0)
-        chronic_avg = chronic_total / 28 if chronic_total > 0 else 1  # avoid div/0
 
+        # Chronic Avg Load = Total Load / 28 days
+        chronic_avg = chronic_total / 28 if chronic_total > 0 else 1
+
+        # ACWR Formula
         acwr = round(acute / (chronic_avg * 7), 2) if chronic_avg > 1 else 0
 
         # --- COACH INSIGHTS ---
@@ -378,41 +345,49 @@ def get_team_analysis():
 
     return jsonify({
         "team_avg_load": round(team_avg_acute, 1),
+        "last_data_date": data[0]['anchor_date'] if data else None,
         "roster": processed_roster
     }), 200
 
 
-# -------------------------------------------------
-# 6. INDIVIDUAL DEEP DIVE (Micro View)
-# -------------------------------------------------
 @app.route('/api/analysis/player/<int:player_id>', methods=['GET'])
 def analyze_player_history(player_id):
     """
-    Fetches 90 days of history, FILLS GAPS using the user's logic,
-    and calculates ACWR/Monotony trends.
+    Fetches 90 days of history, fills gaps, and calculates a
+    0-100 READINESS SCORE based on ACWR and Monotony.
     """
-    # 1. Get Raw Data (90 Days)
+    # 1. Get Raw Data
+    # Using 'duration_minutes' as corrected
+    # Note: We use date math instead of LIMIT to ensure we get the *recent* 90 days
     query = """
-        SELECT activity_date, load_rpe, rpe_score, duration_minutes
+        SELECT activity_date, load_rpe, rpe_score, duration_min
         FROM sessions
         WHERE player_id = %s
-        AND activity_date >= CURRENT_DATE - INTERVAL '90 days'
-        ORDER BY activity_date ASC;
+        ORDER BY activity_date ASC
+        LIMIT 90;
     """
     raw_data = db.execute(query, (player_id,), fetch_all=True)
 
+    # Handle Empty Data Gracefully
     if not raw_data:
-        return jsonify({"error": "No data for player"}), 404
+        return jsonify({
+            "player_id": player_id,
+            "summary": {
+                "current_status": "No Data",
+                "action_required": "Log training sessions to generate insights.",
+                "readiness_score": 0
+            },
+            "history": []
+        }), 200
 
-    # 2. APPLY USER'S GAP FILLING LOGIC
-    # -------------------------------------------------
+    # 2. APPLY GAP FILLING LOGIC
     filled = []
     prev_date = None
 
     for row in raw_data:
         current_date = row["activity_date"]
 
-        # If DB returns string, convert to date object (depends on driver)
+        # Ensure date object
         if isinstance(current_date, str):
             current_date = datetime.strptime(current_date, '%Y-%m-%d').date()
 
@@ -428,9 +403,7 @@ def analyze_player_history(player_id):
                         "is_computed_rest": True
                     })
 
-        # Add the actual row (mark as training)
         row['is_computed_rest'] = False
-        # Ensure date object consistency
         if isinstance(row['activity_date'], str):
             row['activity_date'] = datetime.strptime(row['activity_date'], '%Y-%m-%d').date()
 
@@ -438,42 +411,58 @@ def analyze_player_history(player_id):
         prev_date = current_date
 
     data = filled
-    # -------------------------------------------------
 
-    # 3. CALCULATE METRICS (ACWR & Monotony) on filled data
+    # 3. CALCULATE METRICS & READINESS SCORE
     analyzed_history = []
-
-    # We need at least 28 days of data to start calculating Chronic Load accurately
-    # But we will calculate what we can.
 
     for i in range(len(data)):
         day = data[i]
 
-        # Define Windows (slicing the list backwards from current day)
-        # Acute: Last 7 days
+        # Acute (7 days) & Chronic (28 days) Windows
         start_acute = max(0, i - 6)
         acute_window = [d['load_rpe'] for d in data[start_acute: i + 1]]
 
-        # Chronic: Last 28 days
         start_chronic = max(0, i - 27)
         chronic_window = [d['load_rpe'] for d in data[start_chronic: i + 1]]
 
-        # -- MATH --
+        # Averages
         acute_load = sum(acute_window) / len(acute_window) if acute_window else 0
         chronic_load = sum(chronic_window) / len(chronic_window) if chronic_window else 0
 
         # ACWR
         acwr = round(acute_load / chronic_load, 2) if chronic_load > 10 else 0
 
-        # Monotony (Avg / Stdev) - Indicates burn out risk
+        # Monotony
         if len(acute_window) > 1:
             stdev = statistics.stdev(acute_window)
             monotony = round(statistics.mean(acute_window) / stdev, 2) if stdev > 0 else 0
         else:
             monotony = 0
 
-        # Freshness (Chronic - Acute)
-        freshness = round(chronic_load - acute_load, 0)
+        # --- READINESS SCORE CALCULATION (0-100) ---
+        score = 100
+
+        # A. Injury Risk Penalty (ACWR)
+        if acwr > 1.5:
+            score -= 40  # Danger Zone
+        elif acwr > 1.3:
+            score -= 20  # High Risk
+        elif acwr < 0.8:
+            score -= 10  # Undertrained/Detraining
+
+        # B. Burnout Penalty (Monotony)
+        if monotony > 2.5:
+            score -= 30
+        elif monotony > 1.5:
+            score -= 15
+
+        # C. Fatigue Penalty (Acute > Chronic)
+        # If they are working much harder this week than usual
+        if acute_load > (chronic_load * 1.2):
+            score -= 10
+
+        # Clamp score between 0 and 100
+        readiness_score = max(0, min(100, score))
 
         analyzed_history.append({
             "date": day['activity_date'].strftime('%Y-%m-%d'),
@@ -482,34 +471,193 @@ def analyze_player_history(player_id):
             "chronic_load": round(chronic_load, 0),
             "acwr": acwr,
             "monotony": monotony,
-            "freshness_index": freshness,
+            "readiness_score": readiness_score,  # Replaces freshness_index
             "is_rest": day.get('is_computed_rest', False)
         })
 
     # 4. GENERATE FINAL COACH SUMMARY
-    # Based on the very last entry in the analyzed history
     latest = analyzed_history[-1]
+    current_readiness = latest['readiness_score']
 
     summary = {
-        "current_status": "Normal",
-        "action_required": "None"
+        "readiness_score": current_readiness,
+        "current_status": "Optimal",
+        "action_required": "Maintain current load."
     }
 
-    if latest['acwr'] > 1.5:
-        summary['current_status'] = "DANGER: Spike in Load"
-        summary['action_required'] = "Reduce intensity by 50% next session"
-    elif latest['monotony'] > 2.0:
-        summary['current_status'] = "WARNING: High Monotony"
-        summary['action_required'] = "Mandatory Rest Day or Cross-Training needed"
-    elif latest['freshness_index'] > 200:
-        summary['current_status'] = "High Freshness"
-        summary['action_required'] = "Ready for Peak Performance"
+    # Logic for textual summary based on the Score + Metrics
+    if current_readiness < 60:
+        summary['current_status'] = "Low Readiness (High Risk)"
+        if latest['acwr'] > 1.5:
+            summary['action_required'] = "ACWR Spike detected. Cut volume by 40%."
+        elif latest['monotony'] > 2.0:
+            summary['action_required'] = "Monotony is high. Schedule a Rest Day."
+    elif current_readiness < 80:
+        summary['current_status'] = "Moderately Fatigued"
+        summary['action_required'] = "Monitor intensity during next session."
+    else:
+        summary['current_status'] = "Peak Condition"
+        summary['action_required'] = "Player is ready to perform."
 
     return jsonify({
         "player_id": player_id,
         "summary": summary,
         "history": analyzed_history
     }), 200
+
+
+@app.route('/api/predict-session', methods=['POST'])
+def predict_session():
+    """
+    Inputs: { "player_id": 1, "rpe": 7, "duration": 90 }
+    1. Fetches history from DB.
+    2. Fills date gaps with 0s.
+    3. Calculates Rolling Features.
+    4. Runs Models (Load + Risk).
+    5. Calculates Weighted Risk % based on AI Probability + Mechanical Load + Projected ACWR.
+    """
+    if not load_model or not risk_model:
+        return jsonify({"error": "Models not loaded on server"}), 503
+
+    data = request.json
+    player_id = data.get('player_id')
+    target_rpe = float(data.get('rpe', 5))
+    target_duration = float(data.get('duration', 60))
+
+    # 1. Fetch History
+    query = """
+        SELECT activity_date, load_rpe 
+        FROM sessions 
+        WHERE player_id = %s 
+        ORDER BY activity_date ASC;
+    """
+    raw_data = db.execute(query, (player_id,), fetch_all=True)
+
+    if not raw_data:
+        return jsonify({"error": "Not enough history to predict"}), 400
+
+    # 2. Process Data (Pandas)
+    df = pd.DataFrame(raw_data)
+    df['activity_date'] = pd.to_datetime(df['activity_date'])
+    df.set_index('activity_date', inplace=True)
+
+    # Fill Gaps
+    df = df.resample('D').sum().fillna(0)
+
+    # Rolling Metrics (Current State)
+    df['rolling_7'] = df['load_rpe'].rolling(window=7, min_periods=1).mean()
+    df['rolling_28'] = df['load_rpe'].rolling(window=28, min_periods=1).mean()
+    df['acwr'] = np.where(df['rolling_28'] > 0, df['rolling_7'] / df['rolling_28'], 0)
+
+    # 3. Extract Features
+    last_entry = df.iloc[-1]
+    prev_entry = df.iloc[-2] if len(df) > 1 else last_entry
+
+    last_date = df.index[-1]
+    simulated_date = last_date + pd.Timedelta(days=1)
+    day_of_week = simulated_date.dayofweek
+
+    features = np.array([[
+        day_of_week,
+        last_entry['load_rpe'],
+        prev_entry['load_rpe'],
+        last_entry['rolling_7'],
+        last_entry['rolling_28'],
+        last_entry['acwr'],
+        target_rpe
+    ]])
+
+    # 4. Run Predictions & Calculate Logic
+    try:
+        # --- A. Hybrid Load Calculation (The fix for "weird" model outputs) ---
+        # 1. Get Pure Model Prediction
+        raw_pred_load = float(load_model.predict(features)[0])
+
+        # 2. Calculate Heuristic Load (Physics-based sanity check)
+        # Assumption: sRPE (Dur * RPE) correlates with Mech Load.
+        # A multiplier of ~1.2 to 1.5 usually maps sRPE to AU roughly.
+        heuristic_load = (target_duration * target_rpe) * 1.4
+
+        # 3. Blend them (60% Heuristic / 40% Model)
+        # We weight the heuristic higher to ensure user inputs (Duration/RPE)
+        # directly impact the visual output linearly.
+        final_load = (heuristic_load * 0.6) + (raw_pred_load * 0.4)
+
+        # --- B. Projected Risk Calculation ---
+
+        # 1. Get AI Risk Probability
+        if hasattr(risk_model, "predict_proba"):
+            ai_risk_score = float(risk_model.predict_proba(features)[0][1])
+        else:
+            ai_risk_score = float(risk_model.predict(features)[0])
+
+        # 2. Calculate Projected ACWR (Future State)
+        # We estimate what the Rolling 7 & 28 will be *after* this session
+        current_r7_sum = last_entry['rolling_7'] * 7
+        current_r28_sum = last_entry['rolling_28'] * 28
+
+        proj_rolling_7 = (current_r7_sum + final_load) / 8  # Approximate new avg
+        proj_rolling_28 = (current_r28_sum + final_load) / 29
+
+        proj_acwr = 0
+        if proj_rolling_28 > 0:
+            proj_acwr = proj_rolling_7 / proj_rolling_28
+
+        # 3. Normalize Risk Factors (0.0 to 1.0)
+
+        # Load Risk: 1000 AU is considered "Max/High"
+        load_risk_factor = min(1.0, max(0.0, final_load / 1000.0))
+
+        # ACWR Risk: > 1.5 is dangerous, > 2.0 is critical
+        # We map 1.5 ACWR to roughly 0.8 risk score
+        acwr_risk_factor = min(1.0, max(0.0, (proj_acwr - 0.8) / 1.2))
+
+        # 4. Weighted Formula
+        # 30% AI Model (Pattern recognition)
+        # 30% Absolute Load (Tissue stress)
+        # 40% Projected ACWR (Spike logic)
+        w_ai = 0.30
+        w_load = 0.30
+        w_acwr = 0.40
+
+        total_risk_score = (ai_risk_score * w_ai) + (load_risk_factor * w_load) + (acwr_risk_factor * w_acwr)
+        risk_percentage = round(total_risk_score * 100, 1)
+
+        # --- C. Labels & Visuals ---
+        if risk_percentage < 35:
+            risk_label = "Low"
+            risk_color = "text-emerald-500"
+        elif risk_percentage < 70:
+            risk_label = "Moderate"
+            risk_color = "text-amber-500"
+        else:
+            risk_label = "High"
+            risk_color = "text-rose-500"
+
+        calc_srpe = target_rpe * target_duration
+
+        radar_data = [
+            {"subject": "Load Impact", "A": 0, "B": min(100, (final_load / 1200) * 100)},
+            {"subject": "ACWR Spike", "A": 0, "B": min(100, (proj_acwr / 2.0) * 100)},
+            {"subject": "AI Pattern", "A": 0, "B": ai_risk_score * 100},
+        ]
+
+        return jsonify({
+            "mech_load": round(final_load, 1),
+            "srpe": round(calc_srpe, 1),
+            "risk_percentage": risk_percentage,
+            "risk_label": risk_label,
+            "risk_color": risk_color,
+            "session_type": "High Volume" if target_duration > 80 else "Intensity Focus",
+            "radar_data": radar_data,
+            "projected_acwr": round(proj_acwr, 2)  # Helpful for debug
+        }), 200
+
+    except Exception as e:
+        print(f"Prediction error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": "Model execution failed"}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
