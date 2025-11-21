@@ -77,3 +77,14 @@ class Database:
                 cursor.close()
             if conn:
                 conn.close()
+
+
+db = Database(db_config={
+    'dbname': 'neondb',
+    'user': 'neondb_owner',
+    'password': 'npg_bpru5JTgn3iO',
+    'host': 'ep-steep-poetry-a45xescd-pooler.us-east-1.aws.neon.tech',
+    'port': '5432',
+    'sslmode': 'require'
+})
+

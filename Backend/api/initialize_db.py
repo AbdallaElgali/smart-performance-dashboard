@@ -226,12 +226,14 @@ class DataIngestor:
 
 # Database Config (Use your actual configuration when running)
 DB_CONFIG = {
-    'dbname': 'smart-dashboard-db',
-    'user': 'postgres',
-    'password': 'carga',  # <--- CHANGE THIS
-    'host': 'localhost',
-    'port': '5500'
+    'dbname': 'neondb',
+    'user': 'neondb_owner',
+    'password': 'npg_bpru5JTgn3iO',
+    'host': 'ep-steep-poetry-a45xescd-pooler.us-east-1.aws.neon.tech',
+    'port': '5432',
+    'sslmode': 'require'
 }
+
 def ini():
 
 
@@ -251,6 +253,6 @@ def ini():
     else:
         logger.warning("Ingestion finished with 0 new active sessions inserted.")
 
-
+ini()
 di = DataIngestor(db_config=DB_CONFIG)
 di.enrich_player_profiles('./data/athlete-data.csv')

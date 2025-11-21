@@ -9,11 +9,12 @@ CORS(app)  # Enable CORS for Frontend communication
 
 # Database Config (Update with your local credentials)
 DB_CONFIG = {
-    'dbname': 'smart-dashboard-db',
-    'user': 'postgres',
-    'password': 'carga',  # <--- CHANGE THIS
-    'host': 'localhost',
-    'port': '5500'
+    'dbname': 'neondb',
+    'user': 'neondb_owner',
+    'password': 'npg_bpru5JTgn3iO',
+    'host': 'ep-steep-poetry-a45xescd-pooler.us-east-1.aws.neon.tech',
+    'port': '5432',
+    'sslmode': 'require'
 }
 
 # Initialize DB Class
