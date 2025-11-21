@@ -78,6 +78,40 @@ def get_team_status():
     data = db.execute(query, fetch_all=True)
     return jsonify(data if data else []), 200
 
+# -------------------------------------------------
+# HELPERS
+#--------------------------------------------------
+def acwr_readiness(ac):
+    if 0.8 <= ac <= 1.3:
+        return 100
+    elif 0.6 <= ac < 0.8:
+        return 70
+    elif 1.3 < ac <= 1.5:
+        return 70
+    elif 0.4 <= ac < 0.6:
+        return 50
+    elif 1.5 < ac <= 2.0:
+        return 50
+    else:
+        return 0
+
+def monotony_readiness(monotony):
+    if monotony < 1.5:
+        return 100
+    elif 1.5 <= monotony <= 2.0:
+        return 70
+    else:
+        return 0
+def rpe_readiness(recent_rpes):
+    if not recent_rpes:
+        return 100
+    avg_rpe = sum(recent_rpes) / len(recent_rpes)
+    if all(4 <= r <= 6 for r in recent_rpes):
+        return 70
+    elif avg_rpe < 4:
+        return 50
+    else:
+        return 100
 
 # -------------------------------------------------
 # 3. PLAYER DEEP DIVE (Charts)
@@ -85,8 +119,9 @@ def get_team_status():
 @app.route('/api/player/<int:player_id>/trends', methods=['GET'])
 def get_player_trends(player_id):
     """
-    Analyze last 30 days of Load/RPE to predict Illness, Injury, and Freshness.
+    Analyze last 30 days of Load/RPE to predict Illness, Injury, Freshness, and Readiness.
     """
+    # --- Fetch Data ---
     query = """
         SELECT 
             session_id,
@@ -104,14 +139,10 @@ def get_player_trends(player_id):
     # Fill missing days with rest-day entries (load=0, rpe=0)
     filled = []
     prev_date = None
-
     for row in data:
         current_date = row["activity_date"]
-
         if prev_date is not None:
             delta = (current_date - prev_date).days
-
-            # If gap > 1, fill missing days
             if delta > 1:
                 for i in range(1, delta):
                     missing_date = prev_date + timedelta(days=i)
@@ -122,61 +153,47 @@ def get_player_trends(player_id):
                         "rpe_score": 0,
                         "ac_ratio": None
                     })
-
         filled.append(row)
         prev_date = current_date
-
     data = filled
-
 
     if not data:
         return jsonify([]), 200
 
-    # --- HEURISTIC ANALYSIS ENGINE ---
-    insights = []
-
-    # Helper: Extract lists for calculations
+    # --- Prepare Metrics ---
     loads = [d['external_load'] for d in data if d['external_load'] is not None]
     latest = data[-1]
     current_ac = latest.get('ac_ratio') or 0
 
-    # ---------------------------------------------------------
-    # INSIGHT 1: ILLNESS RISK (Training Monotony)
-    # ---------------------------------------------------------
-    # We need at least 1 week of data to calculate variation
+    # --- INSIGHT ENGINE ---
+    insights = []
+
+    # Insight 1: Illness Risk (Training Monotony)
     if len(loads) >= 7:
         last_7_loads = loads[-7:]
         avg_load = sum(last_7_loads) / 7
-        # Calculate Standard Deviation (Population)
-        variance = sum([((x - avg_load) ** 2) for x in last_7_loads]) / 7
+        variance = sum((x - avg_load) ** 2 for x in last_7_loads) / 7
         std_dev = variance ** 0.5
+        monotony = avg_load / std_dev if std_dev > 0 else 0
 
-        # Avoid division by zero
-        if std_dev > 10:
-            monotony = avg_load / std_dev
+        if monotony > 2.0:
+            insights.append({
+                "type": "CRITICAL",
+                "title": "Illness Risk Elevated",
+                "score": 9,
+                "message": f"Training Monotony is {monotony:.1f} (High). Lack of rest days detected.",
+                "action": "Mandatory Rest Day or Active Recovery tomorrow to reset variation."
+            })
+        elif monotony > 1.5:
+            insights.append({
+                "type": "WARNING",
+                "title": "Staleness Risk",
+                "score": 6,
+                "message": "Training variation is low. Player may feel 'stale' or mentally fatigued.",
+                "action": "Vary the intensity of the next drill (High/Low)."
+            })
 
-            if monotony > 2.0:
-                insights.append({
-                    "type": "CRITICAL",
-                    "title": "Illness Risk Elevated",
-                    "score": 9,  # Importance Score
-                    "message": f"Training Monotony is {monotony:.1f} (High). Lack of rest days detected.",
-                    "action": "Mandatory Rest Day or Active Recovery tomorrow to reset variation."
-                })
-            elif monotony > 1.5:
-                insights.append({
-                    "type": "WARNING",
-                    "title": "Staleness Risk",
-                    "score": 6,
-                    "message": "Training variation is low. Player may feel 'stale' or mentally fatigued.",
-                    "action": "Vary the intensity of the next drill (High/Low)."
-                })
-
-    # ---------------------------------------------------------
-    # INSIGHT 2: INJURY RISK (ACWR Sweet Spot)
-    # ---------------------------------------------------------
-    # Standard Gabbett Model: 0.8 - 1.3 is safe.
-
+    # Insight 2: Injury Risk (ACWR Sweet Spot)
     if current_ac > 1.5:
         insights.append({
             "type": "CRITICAL",
@@ -202,17 +219,12 @@ def get_player_trends(player_id):
             "action": "Maintain current progression."
         })
 
-    # ---------------------------------------------------------
-    # INSIGHT 3: THE "GREY ZONE" (Intensity Check)
-    # ---------------------------------------------------------
-    # Check the last 5 sessions. If RPE is always 4, 5, or 6, they are coasting.
+    # Insight 3: Grey Zone / Intensity Check
     if len(data) >= 5:
-        recent_rpes = [d['rpe_score'] for d in data[-5:] if d['rpe_score']]
+        recent_rpes = [d['rpe_score'] for d in data[-5:] if d['rpe_score'] is not None]
         if recent_rpes:
             avg_rpe = sum(recent_rpes) / len(recent_rpes)
-            is_grey_zone = all(4 <= r <= 6 for r in recent_rpes)
-
-            if is_grey_zone:
+            if all(4 <= r <= 6 for r in recent_rpes):
                 insights.append({
                     "type": "WARNING",
                     "title": "Grey Zone Training",
@@ -221,12 +233,35 @@ def get_player_trends(player_id):
                     "action": "Prescribe either a Sprint Session (RPE 8+) or Deep Recovery (RPE <3)."
                 })
 
-    # Sort insights by importance (score) so the Dashboard shows the big issues first
     insights.sort(key=lambda x: x['score'], reverse=True)
+
+    # --- READINESS SCORE CALCULATION ---
+    acwr_subscore = acwr_readiness(current_ac)
+    monotony_subscore = monotony_readiness(monotony if len(loads) >= 7 else 0)
+    rpe_subscore = rpe_readiness(recent_rpes if len(data) >= 5 else [])
+
+    readiness_score = round(
+        0.4 * acwr_subscore +
+        0.3 * monotony_subscore +
+        0.3 * rpe_subscore
+    )
+
+    if readiness_score >= 85:
+        readiness_status = "Fully Ready"
+    elif readiness_score >= 70:
+        readiness_status = "Moderately Ready"
+    elif readiness_score >= 50:
+        readiness_status = "Low Readiness – caution advised"
+    else:
+        readiness_status = "High Risk – Rest or Recovery Required"
 
     response = {
         "chart_data": data,
-        "insights": insights
+        "insights": insights,
+        "readiness": {
+            "score": readiness_score,
+            "status": readiness_status
+        }
     }
 
     return jsonify(response), 200
