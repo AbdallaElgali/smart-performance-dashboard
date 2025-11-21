@@ -2,6 +2,8 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dbconn import Database
 from datetime import datetime, timedelta
+import statistics
+from datetime import date
 
 # ================= CONFIGURATION =================
 app = Flask(__name__)
@@ -29,7 +31,7 @@ def health_check():
     return jsonify({"status": "ok", "message": "Basketball Analytics API is live"}), 200
 
 
-# -------------------------------------------------
+# --------------------------------- ----------------
 # 1. PLAYER MANAGEMENT
 # -------------------------------------------------
 @app.route('/api/players', methods=['GET'])
@@ -304,6 +306,210 @@ def submit_wellness():
         return jsonify({"message": "Wellness logged", "id": result['wellness_id']}), 201
     return jsonify({"error": "Failed to log wellness"}), 500
 
+
+# -------------------------------------------------
+# 5. TEAM ANALYSIS (Macro View)
+# -------------------------------------------------
+@app.route('/api/analysis/team', methods=['GET'])
+def get_team_analysis():
+    """
+    Aggregates data for the last 7 and 28 days to compare players.
+    Returns: Team Average, Risky Players, High Performers.
+    """
+    # Fetch aggregated loads for last 7 days (Acute) and 28 days (Chronic)
+    query = """
+        SELECT 
+            p.player_id, 
+            p.name, 
+            p.player_position as position,
+            COUNT(s.session_id) as session_count,
+            SUM(CASE WHEN s.activity_date >= CURRENT_DATE - INTERVAL '7 days' THEN s.load_rpe ELSE 0 END) as acute_load,
+            SUM(CASE WHEN s.activity_date >= CURRENT_DATE - INTERVAL '28 days' THEN s.load_rpe ELSE 0 END) as chronic_sum
+        FROM players p
+        LEFT JOIN sessions s ON p.player_id = s.player_id 
+        AND s.activity_date >= CURRENT_DATE - INTERVAL '28 days'
+        GROUP BY p.player_id, p.name, p.player_position;
+    """
+    data = db.execute(query, fetch_all=True)
+
+    if not data:
+        return jsonify({"error": "No data found"}), 404
+
+    processed_roster = []
+
+    # Calculate Team Averages for Context
+    all_acute_loads = [d['acute_load'] for d in data]
+    team_avg_acute = statistics.mean(all_acute_loads) if all_acute_loads else 0
+
+    for p in data:
+        acute = float(p['acute_load'] or 0)
+        # Chronic Load is average per day over 28 days, roughly
+        chronic_total = float(p['chronic_sum'] or 0)
+        chronic_avg = chronic_total / 28 if chronic_total > 0 else 1  # avoid div/0
+
+        acwr = round(acute / (chronic_avg * 7), 2) if chronic_avg > 1 else 0
+
+        # --- COACH INSIGHTS ---
+        status = "Optimal"
+        flag = "green"
+
+        if acwr > 1.5:
+            status = "High Injury Risk (Spike)"
+            flag = "red"
+        elif acwr < 0.8:
+            status = "Detraining / Tapering"
+            flag = "yellow"
+        elif acute > (team_avg_acute * 1.5):
+            status = "Workhorse (High Volume)"
+            flag = "orange"
+
+        processed_roster.append({
+            "name": p['name'],
+            "position": p['position'],
+            "acute_load": acute,
+            "acwr": acwr,
+            "status": status,
+            "flag": flag,
+            "sessions_last_28": p['session_count']
+        })
+
+    # Sort by Acute Load (Highest first)
+    processed_roster.sort(key=lambda x: x['acute_load'], reverse=True)
+
+    return jsonify({
+        "team_avg_load": round(team_avg_acute, 1),
+        "roster": processed_roster
+    }), 200
+
+
+# -------------------------------------------------
+# 6. INDIVIDUAL DEEP DIVE (Micro View)
+# -------------------------------------------------
+@app.route('/api/analysis/player/<int:player_id>', methods=['GET'])
+def analyze_player_history(player_id):
+    """
+    Fetches 90 days of history, FILLS GAPS using the user's logic,
+    and calculates ACWR/Monotony trends.
+    """
+    # 1. Get Raw Data (90 Days)
+    query = """
+        SELECT activity_date, load_rpe, rpe_score, duration_minutes
+        FROM sessions
+        WHERE player_id = %s
+        AND activity_date >= CURRENT_DATE - INTERVAL '90 days'
+        ORDER BY activity_date ASC;
+    """
+    raw_data = db.execute(query, (player_id,), fetch_all=True)
+
+    if not raw_data:
+        return jsonify({"error": "No data for player"}), 404
+
+    # 2. APPLY USER'S GAP FILLING LOGIC
+    # -------------------------------------------------
+    filled = []
+    prev_date = None
+
+    for row in raw_data:
+        current_date = row["activity_date"]
+
+        # If DB returns string, convert to date object (depends on driver)
+        if isinstance(current_date, str):
+            current_date = datetime.strptime(current_date, '%Y-%m-%d').date()
+
+        if prev_date is not None:
+            delta = (current_date - prev_date).days
+            if delta > 1:
+                for i in range(1, delta):
+                    missing_date = prev_date + timedelta(days=i)
+                    filled.append({
+                        "activity_date": missing_date,
+                        "load_rpe": 0,
+                        "rpe_score": 0,
+                        "is_computed_rest": True
+                    })
+
+        # Add the actual row (mark as training)
+        row['is_computed_rest'] = False
+        # Ensure date object consistency
+        if isinstance(row['activity_date'], str):
+            row['activity_date'] = datetime.strptime(row['activity_date'], '%Y-%m-%d').date()
+
+        filled.append(row)
+        prev_date = current_date
+
+    data = filled
+    # -------------------------------------------------
+
+    # 3. CALCULATE METRICS (ACWR & Monotony) on filled data
+    analyzed_history = []
+
+    # We need at least 28 days of data to start calculating Chronic Load accurately
+    # But we will calculate what we can.
+
+    for i in range(len(data)):
+        day = data[i]
+
+        # Define Windows (slicing the list backwards from current day)
+        # Acute: Last 7 days
+        start_acute = max(0, i - 6)
+        acute_window = [d['load_rpe'] for d in data[start_acute: i + 1]]
+
+        # Chronic: Last 28 days
+        start_chronic = max(0, i - 27)
+        chronic_window = [d['load_rpe'] for d in data[start_chronic: i + 1]]
+
+        # -- MATH --
+        acute_load = sum(acute_window) / len(acute_window) if acute_window else 0
+        chronic_load = sum(chronic_window) / len(chronic_window) if chronic_window else 0
+
+        # ACWR
+        acwr = round(acute_load / chronic_load, 2) if chronic_load > 10 else 0
+
+        # Monotony (Avg / Stdev) - Indicates burn out risk
+        if len(acute_window) > 1:
+            stdev = statistics.stdev(acute_window)
+            monotony = round(statistics.mean(acute_window) / stdev, 2) if stdev > 0 else 0
+        else:
+            monotony = 0
+
+        # Freshness (Chronic - Acute)
+        freshness = round(chronic_load - acute_load, 0)
+
+        analyzed_history.append({
+            "date": day['activity_date'].strftime('%Y-%m-%d'),
+            "daily_load": day['load_rpe'],
+            "acute_load": round(acute_load, 0),
+            "chronic_load": round(chronic_load, 0),
+            "acwr": acwr,
+            "monotony": monotony,
+            "freshness_index": freshness,
+            "is_rest": day.get('is_computed_rest', False)
+        })
+
+    # 4. GENERATE FINAL COACH SUMMARY
+    # Based on the very last entry in the analyzed history
+    latest = analyzed_history[-1]
+
+    summary = {
+        "current_status": "Normal",
+        "action_required": "None"
+    }
+
+    if latest['acwr'] > 1.5:
+        summary['current_status'] = "DANGER: Spike in Load"
+        summary['action_required'] = "Reduce intensity by 50% next session"
+    elif latest['monotony'] > 2.0:
+        summary['current_status'] = "WARNING: High Monotony"
+        summary['action_required'] = "Mandatory Rest Day or Cross-Training needed"
+    elif latest['freshness_index'] > 200:
+        summary['current_status'] = "High Freshness"
+        summary['action_required'] = "Ready for Peak Performance"
+
+    return jsonify({
+        "player_id": player_id,
+        "summary": summary,
+        "history": analyzed_history
+    }), 200
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
